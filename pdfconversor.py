@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+
+import sys
+import subprocess
+from pathlib import Path
+
+SUPPORTED_EXTENSIONS = {
+    # Documentos de texto
+    '.doc', '.docx', '.odt', '.rtf', '.txt',
+    # Hojas de cálculo
+    '.xls', '.xlsx', '.ods', '.csv',
+    # Presentaciones
+    '.ppt', '.pptx', '.odp',
+    # Otros
+    '.html', '.htm', '.epub',
+}
+
+
+def resolve_path(raw):
+    """Devuelve la ruta real resuelta (canonicalizada, sin symlinks ni ..)."""
+    return Path(raw).resolve()
+
+
+def safe_output_dir(output_dir_raw):
+    """Resuelve y crea el directorio de salida."""
+    dest = resolve_path(output_dir_raw)
+    dest.mkdir(parents=True, exist_ok=True)
+    return dest
+
+
+def convert_to_pdf(filepath, output_dir=None, batch=False):
+    path = resolve_path(filepath)
+
+    if not path.is_file():
+        print(f"Error: el archivo '{filepath}' no existe.")
+        if not batch:
+            sys.exit(1)
+        return False
+
+    ext = path.suffix.lower()
+
+    if ext == '.pdf':
+        print(f"'{path}' ya es un PDF.")
+        if not batch:
+            sys.exit(0)
+        return True
+
+    if ext not in SUPPORTED_EXTENSIONS:
+        print(f"Error: extensión '{ext}' no soportada.")
+        if not batch:
+            print(f"Extensiones soportadas: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
+            sys.exit(1)
+        return False
+
+    dest = output_dir if output_dir else path.parent
+
+    result = subprocess.run(
+        [
+            'libreoffice', '--headless',
+            '--convert-to', 'pdf',
+            '--outdir', str(dest),
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        print(f"Error al convertir '{path.name}': {result.stderr}")
+        if not batch:
+            sys.exit(1)
+        return False
+
+    output_pdf = dest / (path.stem + '.pdf')
+    print(f"Convertido: {output_pdf}")
+    return True
+
+
+def convert_all(source_dir='.', output_dir=None):
+    source = resolve_path(source_dir)
+
+    if not source.is_dir():
+        print(f"Error: '{source_dir}' no es un directorio.")
+        sys.exit(1)
+
+    dest = safe_output_dir(output_dir) if output_dir else None
+
+    files = [
+        f for f in source.iterdir()
+        if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
+    ]
+
+    if not files:
+        print("No se encontraron archivos compatibles.")
+        sys.exit(0)
+
+    ok = sum(1 for f in files if convert_to_pdf(f, output_dir=dest, batch=True))
+    print(f"\n{ok}/{len(files)} archivos convertidos.")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Uso: pdfconversor <archivo> [destino]")
+        print("     pdfconversor -a [origen] [destino]")
+        sys.exit(1)
+
+    if sys.argv[1] in ('-a', '--all'):
+        source = sys.argv[2] if len(sys.argv) >= 3 else '.'
+        output = sys.argv[3] if len(sys.argv) >= 4 else None
+        convert_all(source, output)
+    else:
+        output = safe_output_dir(sys.argv[2]) if len(sys.argv) >= 3 else None
+        convert_to_pdf(sys.argv[1], output_dir=output)
+
+
+if __name__ == '__main__':
+    main()
