@@ -73,4 +73,5 @@ pdfconversor -a /ruta/origen /ruta/destino
 ```bash
 pdfconversor -h        # o --help
 pdfconversor -v        # o --version
+pdfconversor -g        # o --guia (guía de uso completa, con ejemplos)
 ```

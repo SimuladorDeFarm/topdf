@@ -108,8 +108,83 @@ def print_help():
     print("  -a, --all      Convierte todos los archivos compatibles de una carpeta")
     print("  -h, --help     Muestra esta ayuda")
     print("  -v, --version  Muestra la versión")
+    print("  -g, --guia     Muestra la guía de uso completa")
     print()
     print(f"Extensiones soportadas: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
+
+
+def print_guide():
+    print(f"""
+pdfconversor — Conversor de documentos a PDF (v{VERSION})
+============================================================
+
+¿Qué hace?
+-----------
+Convierte archivos de oficina (Word, Excel, PowerPoint, OpenDocument,
+texto, HTML, ePub, etc.) a PDF usando LibreOffice en modo headless
+(sin abrir ninguna interfaz gráfica). Funciona con un archivo a la vez
+o con todos los archivos compatibles de una carpeta.
+
+Formatos soportados:
+    {', '.join(sorted(SUPPORTED_EXTENSIONS))}
+
+Dependencias del sistema:
+    - Python 3
+    - LibreOffice (el motor real de conversión)
+
+      Arch / Manjaro:   sudo pacman -S python libreoffice-still
+      Debian / Ubuntu:  sudo apt install python3 libreoffice
+
+Instalación (para poder llamarlo desde cualquier carpeta, sin "python3" delante):
+
+    sudo cp topdf /usr/local/bin/pdfconversor
+    sudo chmod +x /usr/local/bin/pdfconversor
+
+    o, sin sudo, en tu carpeta personal:
+
+    cp topdf ~/.local/bin/pdfconversor
+    chmod +x ~/.local/bin/pdfconversor
+
+    (asegúrate de que ~/.local/bin esté en tu $PATH)
+
+Modos de uso
+------------
+
+1) Convertir un único archivo (se guarda en la misma carpeta del original):
+
+       pdfconversor documento.docx
+
+2) Convertir un único archivo a una carpeta de destino concreta
+   (se crea automáticamente si no existe):
+
+       pdfconversor documento.docx /ruta/destino
+
+3) Convertir TODOS los archivos compatibles de la carpeta actual:
+
+       pdfconversor -a
+       pdfconversor --all
+
+4) Convertir todos los archivos de una carpeta de origen concreta:
+
+       pdfconversor -a /ruta/origen
+
+5) Convertir todos los archivos de un origen a un destino concreto:
+
+       pdfconversor -a /ruta/origen /ruta/destino
+
+Opciones
+--------
+    -a, --all       Convierte todos los archivos compatibles de una carpeta
+    -h, --help      Muestra la ayuda resumida
+    -v, --version   Muestra la versión instalada
+    -g, --guia      Muestra esta guía completa de uso
+
+Notas
+-----
+- Si el archivo ya es un .pdf, no se vuelve a convertir.
+- Si la extensión no está soportada, el programa avisa y se detiene.
+- Las rutas se resuelven de forma absoluta (sin symlinks ni "..").
+""")
 
 
 def main():
@@ -123,6 +198,10 @@ def main():
 
     if sys.argv[1] in ('-v', '--version'):
         print(f"pdfconversor {VERSION}")
+        sys.exit(0)
+
+    if sys.argv[1] in ('-g', '--guia'):
+        print_guide()
         sys.exit(0)
 
     if sys.argv[1] in ('-a', '--all'):
