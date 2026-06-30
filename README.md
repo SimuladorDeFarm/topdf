@@ -67,3 +67,10 @@ pdfconversor -a /ruta/origen /ruta/destino
 ```
 
 > Si la carpeta de destino no existe, se crea automáticamente.
+
+### Ayuda y versión
+
+```bash
+pdfconversor -h        # o --help
+pdfconversor -v        # o --version
+```
