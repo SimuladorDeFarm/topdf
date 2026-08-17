@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 
-import sys
+import os
+import shutil
 import subprocess
+import sys
+import tempfile
+from collections import namedtuple
 from pathlib import Path
 
-VERSION = '1.0.0'
+VERSION = '2.0.0'
 
 BANNER = r"""
  _____ ___  ____  ____  _____
@@ -25,9 +29,44 @@ SUPPORTED_EXTENSIONS = {
     '.html', '.htm', '.epub',
 }
 
+# Tiempo máximo por archivo. Un documento malformado puede atascar el
+# analizador de LibreOffice indefinidamente.
+DEFAULT_TIMEOUT = 120
+
+# Rutas fijas donde buscar los binarios, en orden. No se consulta el $PATH.
+SOFFICE_CANDIDATES = (
+    '/usr/bin/libreoffice',
+    '/usr/bin/soffice',
+    '/usr/local/bin/libreoffice',
+    '/usr/lib/libreoffice/program/soffice',
+    '/opt/libreoffice/program/soffice',
+)
+
+BWRAP_CANDIDATES = (
+    '/usr/bin/bwrap',
+    '/bin/bwrap',
+    '/usr/local/bin/bwrap',
+)
+
+# Perfil de LibreOffice dentro del sandbox: vive en el /tmp efímero, así que
+# desaparece al terminar la conversión y nada puede persistir en el perfil real.
+SANDBOX_PROFILE = 'file:///tmp/lo-profile'
+
+# Resultados posibles de una conversión.
+OK = 'ok'
+SKIPPED = 'saltado'
+FAILED = 'fallido'
+
+Tools = namedtuple('Tools', 'soffice bwrap')
+
 
 def resolve_path(raw):
-    """Devuelve la ruta real resuelta (canonicalizada, sin symlinks ni ..)."""
+    """Devuelve la ruta absoluta y canonicalizada.
+
+    Ojo: resolve() *sigue* los enlaces simbólicos, no los rechaza. Quien
+    necesite garantizar que un archivo no se sale de su carpeta debe
+    comprobarlo aparte (ver collect_files).
+    """
     return Path(raw).resolve()
 
 
@@ -38,74 +77,237 @@ def safe_output_dir(output_dir_raw):
     return dest
 
 
-def convert_to_pdf(filepath, output_dir=None, batch=False):
+def first_executable(candidates):
+    """Primer candidato que exista y sea ejecutable."""
+    for candidate in candidates:
+        if Path(candidate).is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def find_binaries():
+    """Localiza los binarios necesarios en rutas fijas del sistema.
+
+    A propósito no se usa el $PATH: cualquier directorio escribible que lo
+    preceda permitiría suplantar el motor de conversión. Para instalaciones
+    fuera de lo común está TOPDF_SOFFICE, que se anuncia al usarse para que
+    la sustitución nunca sea silenciosa.
+    """
+    override = os.environ.get('TOPDF_SOFFICE')
+    if override:
+        if not (Path(override).is_file() and os.access(override, os.X_OK)):
+            print(f"Error: TOPDF_SOFFICE apunta a '{override}', que no es ejecutable.")
+            sys.exit(1)
+        print(f"Aviso: usando LibreOffice indicado en TOPDF_SOFFICE: {override}")
+        soffice = override
+    else:
+        soffice = first_executable(SOFFICE_CANDIDATES)
+
+    if not soffice:
+        print("Error: no se encontró LibreOffice, que es el motor de conversión.")
+        print("Instala:  sudo pacman -S libreoffice-still")
+        print("      o:  sudo apt install libreoffice")
+        print("Si lo tienes en una ruta poco común, indícala con TOPDF_SOFFICE.")
+        sys.exit(1)
+
+    bwrap = first_executable(BWRAP_CANDIDATES)
+    if not bwrap:
+        print("Error: no se encontró 'bwrap'. La conversión de documentos no")
+        print("confiables requiere aislamiento de red.")
+        print("Instala:  sudo pacman -S bubblewrap")
+        print("      o:  sudo apt install bubblewrap")
+        sys.exit(1)
+
+    return Tools(soffice=soffice, bwrap=bwrap)
+
+
+def conversion_timeout():
+    """Segundos permitidos por archivo. TOPDF_TIMEOUT lo ajusta."""
+    try:
+        value = int(os.environ.get('TOPDF_TIMEOUT', DEFAULT_TIMEOUT))
+    except ValueError:
+        return DEFAULT_TIMEOUT
+    return value if value > 0 else DEFAULT_TIMEOUT
+
+
+def build_sandbox_cmd(tools, src, staging):
+    """Orden de conversión aislada: sistema en sólo lectura y sin red.
+
+    Un documento puede referenciar recursos externos, y LibreOffice los
+    descarga sin preguntar. Dentro de este sandbox no hay red que usar.
+    """
+    return [
+        tools.bwrap,
+        '--ro-bind', '/', '/',
+        '--dev', '/dev',
+        '--proc', '/proc',
+        # El tmpfs va antes que los bind de abajo: si fuese después, taparía
+        # el directorio de paso cuando éste cuelga de /tmp.
+        '--tmpfs', '/tmp',
+        '--bind', str(staging), str(staging),
+        '--ro-bind', str(src), str(src),
+        '--unshare-net',
+        # Espacio de PIDs propio: LibreOffice arranca varios procesos y el
+        # último es nieto de bwrap. Sin esto, al agotarse el tiempo límite
+        # soffice.bin sobrevive suelto en el sistema; dentro del namespace es
+        # el PID 1 y el núcleo se lleva por delante todo lo que quede.
+        '--unshare-pid',
+        '--unshare-ipc',
+        '--die-with-parent',
+        '--new-session',
+        '--',
+        tools.soffice, '--headless',
+        f'-env:UserInstallation={SANDBOX_PROFILE}',
+        '--convert-to', 'pdf',
+        '--outdir', str(staging),
+        str(src),
+    ]
+
+
+def sandbox_env():
+    """Entorno mínimo para el proceso hijo, sin DISPLAY ni variables ajenas."""
+    return {
+        'PATH': '/usr/bin:/bin',
+        'HOME': os.environ.get('HOME', '/tmp'),
+        'LANG': os.environ.get('LANG', 'C.UTF-8'),
+    }
+
+
+def unique_destination(dest, stem):
+    """Primer nombre libre: informe.pdf, informe-2.pdf, informe-3.pdf…"""
+    candidate = dest / f'{stem}.pdf'
+    n = 2
+    # lexists en vez de exists: un enlace roto también ocupa el nombre.
+    while candidate.exists() or candidate.is_symlink():
+        candidate = dest / f'{stem}-{n}.pdf'
+        n += 1
+    return candidate
+
+
+def run_conversion(path, dest, tools):
+    """Convierte a un directorio de paso y mueve el resultado. Devuelve la
+    ruta final, o None si falló.
+
+    LibreOffice devuelve 0 con frecuencia aunque no haya convertido nada, así
+    que el criterio de éxito es que el archivo exista. El directorio de paso
+    empieza vacío, de modo que su presencia no admite dudas: no puede ser un
+    PDF anterior. De paso, un PDF a medio escribir nunca llega a la carpeta
+    del usuario.
+    """
+    staging = Path(tempfile.mkdtemp(prefix='topdf-'))
+    timeout = conversion_timeout()
+
+    try:
+        try:
+            result = subprocess.run(
+                build_sandbox_cmd(tools, path, staging),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=sandbox_env(),
+            )
+        except subprocess.TimeoutExpired:
+            print(f"Error: '{path.name}' superó el límite de {timeout}s y se canceló.")
+            return None
+
+        produced = staging / (path.stem + '.pdf')
+        if not produced.is_file():
+            detail = (result.stderr or result.stdout or '').strip().splitlines()
+            motivo = detail[-1] if detail else 'LibreOffice no generó ningún archivo'
+            print(f"Error al convertir '{path.name}': {motivo}")
+            return None
+
+        final = unique_destination(dest, path.stem)
+        shutil.move(str(produced), str(final))
+        return final
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def convert_to_pdf(filepath, tools, output_dir=None):
     path = resolve_path(filepath)
 
     if not path.is_file():
         print(f"Error: el archivo '{filepath}' no existe.")
-        if not batch:
-            sys.exit(1)
-        return False
+        return FAILED
 
     ext = path.suffix.lower()
 
     if ext == '.pdf':
         print(f"'{path}' ya es un PDF.")
-        if not batch:
-            sys.exit(0)
-        return True
+        return SKIPPED
 
     if ext not in SUPPORTED_EXTENSIONS:
         print(f"Error: extensión '{ext}' no soportada.")
-        if not batch:
-            print(f"Extensiones soportadas: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
-            sys.exit(1)
-        return False
+        print(f"Extensiones soportadas: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
+        return FAILED
 
     dest = output_dir if output_dir else path.parent
 
-    result = subprocess.run(
-        [
-            'libreoffice', '--headless',
-            '--convert-to', 'pdf',
-            '--outdir', str(dest),
-            str(path),
-        ],
-        capture_output=True,
-        text=True,
-    )
+    final = run_conversion(path, dest, tools)
+    if final is None:
+        return FAILED
 
-    if result.returncode != 0:
-        print(f"Error al convertir '{path.name}': {result.stderr}")
-        if not batch:
-            sys.exit(1)
-        return False
-
-    output_pdf = dest / (path.stem + '.pdf')
-    print(f"Convertido: {output_pdf}")
-    return True
+    print(f"Convertido: {final}")
+    return OK
 
 
-def convert_all(source_dir='.', output_dir=None):
+def collect_files(source):
+    """Archivos convertibles de una carpeta, sin los que se salen de ella.
+
+    Un enlace simbólico dentro de una carpeta recibida de terceros puede
+    apuntar a cualquier archivo legible del sistema; convertirlo dejaría ese
+    contenido en la carpeta de salida.
+    """
+    files = []
+    escapes = []
+
+    for entry in sorted(source.iterdir()):
+        if not entry.is_file():
+            continue
+        if entry.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            continue
+        if not entry.resolve().is_relative_to(source):
+            escapes.append(entry)
+            continue
+        files.append(entry)
+
+    return files, escapes
+
+
+def convert_all(source_dir, tools, output_dir=None):
     source = resolve_path(source_dir)
 
     if not source.is_dir():
         print(f"Error: '{source_dir}' no es un directorio.")
-        sys.exit(1)
+        return 1
 
     dest = safe_output_dir(output_dir) if output_dir else None
 
-    files = [
-        f for f in source.iterdir()
-        if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
-    ]
+    files, escapes = collect_files(source)
+
+    for entry in escapes:
+        print(f"Saltado: '{entry.name}' apunta fuera de la carpeta de origen.")
 
     if not files:
-        print("No se encontraron archivos compatibles.")
-        sys.exit(0)
+        if not escapes:
+            print("No se encontraron archivos compatibles.")
+        return 0
 
-    ok = sum(1 for f in files if convert_to_pdf(f, output_dir=dest, batch=True))
-    print(f"\n{ok}/{len(files)} archivos convertidos.")
+    ok = failed = 0
+    skipped = len(escapes)
+
+    for f in files:
+        status = convert_to_pdf(f, tools, output_dir=dest)
+        if status == OK:
+            ok += 1
+        elif status == SKIPPED:
+            skipped += 1
+        else:
+            failed += 1
+
+    print(f"\n{ok} convertidos, {skipped} saltados, {failed} fallidos.")
+    return 1 if failed else 0
 
 
 def print_help():
@@ -139,9 +341,10 @@ Formatos soportados:
 Dependencias del sistema:
     - Python 3
     - LibreOffice (el motor real de conversión)
+    - bubblewrap (el aislamiento en el que se ejecuta LibreOffice)
 
-      Arch / Manjaro:   sudo pacman -S python libreoffice-still
-      Debian / Ubuntu:  sudo apt install python3 libreoffice
+      Arch / Manjaro:   sudo pacman -S python libreoffice-still bubblewrap
+      Debian / Ubuntu:  sudo apt install python3 libreoffice bubblewrap
 
 Instalación (para poder llamarlo desde cualquier carpeta, sin "python3" delante):
 
@@ -187,11 +390,33 @@ Opciones
     -v, --version   Muestra la versión instalada
     -g, --guia      Muestra esta guía completa de uso
 
+Seguridad
+---------
+Este programa existe para abrir documentos que te envían otras personas, así
+que da por hecho que el archivo de entrada puede ser hostil:
+
+- La conversión ocurre dentro de un sandbox (bubblewrap) SIN ACCESO A RED. Un
+  documento puede llevar imágenes o enlaces a servidores externos, y
+  LibreOffice los descargaría sin preguntar: eso revelaría a quien te envió el
+  archivo cuándo lo abriste y desde qué IP. Efecto secundario: si un documento
+  legítimo enlaza una imagen remota, saldrá un hueco en su lugar.
+- LibreOffice se ejecuta con un perfil desechable y con el resto del sistema
+  montado en sólo lectura, así que ningún documento puede dejar rastro en tu
+  configuración.
+- Cada archivo tiene un límite de {DEFAULT_TIMEOUT} segundos (ajustable con la variable
+  de entorno TOPDF_TIMEOUT). Un documento diseñado para atascar el analizador
+  no bloquea el resto del lote.
+
 Notas
 -----
 - Si el archivo ya es un .pdf, no se vuelve a convertir.
 - Si la extensión no está soportada, el programa avisa y se detiene.
-- Las rutas se resuelven de forma absoluta (sin symlinks ni "..").
+- Nunca se sobrescribe un PDF existente: si el nombre está ocupado, el nuevo
+  archivo se guarda como documento-2.pdf, documento-3.pdf, etc.
+- Las rutas se resuelven de forma absoluta. En modo -a se omiten los enlaces
+  simbólicos que apunten fuera de la carpeta de origen; si nombras un enlace
+  directamente como argumento, sí se convierte.
+- El programa termina con código distinto de cero si alguna conversión falla.
 """)
 
 
@@ -214,13 +439,16 @@ def main():
         print_guide()
         sys.exit(0)
 
+    tools = find_binaries()
+
     if sys.argv[1] in ('-a', '--all'):
         source = sys.argv[2] if len(sys.argv) >= 3 else '.'
         output = sys.argv[3] if len(sys.argv) >= 4 else None
-        convert_all(source, output)
+        sys.exit(convert_all(source, tools, output))
     else:
         output = safe_output_dir(sys.argv[2]) if len(sys.argv) >= 3 else None
-        convert_to_pdf(sys.argv[1], output_dir=output)
+        status = convert_to_pdf(sys.argv[1], tools, output_dir=output)
+        sys.exit(1 if status == FAILED else 0)
 
 
 if __name__ == '__main__':
