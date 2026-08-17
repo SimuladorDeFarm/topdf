@@ -29,14 +29,14 @@ sudo apt install python3 libreoffice bubblewrap
 Para poder llamarlo desde cualquier directorio sin escribir `python3` delante:
 
 ```bash
-sudo cp pdfconversor.py /usr/local/bin/pdfconversor
+sudo cp topdf /usr/local/bin/pdfconversor
 sudo chmod +x /usr/local/bin/pdfconversor
 ```
 
 O sin `sudo`, en tu directorio personal:
 
 ```bash
-cp pdfconversor.py ~/.local/bin/pdfconversor
+cp topdf ~/.local/bin/pdfconversor
 chmod +x ~/.local/bin/pdfconversor
 ```
 
